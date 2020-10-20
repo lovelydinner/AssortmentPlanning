@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 '''
     File name: staticMNL.py
-    Author: Chua Yonzheng Jerry (@lovelydinner)
-    Date created: 9/20/2020
-    Date last modified: 9/28/2020
+    Author: Chua Yonzheng Jerry
+    Date created: 7/10/2020
+    Date last modified: 20/10/2020
     Python Version: 3.7.6
 '''
-
 
 import pandas as pd
 import numpy as np
 import itertools
+from collections import deque
+from operator import itemgetter
 
 class MNL():
     '''
@@ -57,15 +58,22 @@ class MNL():
         #O(N^2)
         for i in range(len(self.profits)-1):
             for j in range(i+1, len(self.profits)):
+                #here our count indexing starts from 0, when it should be 1
                 pairs.append( (i,j) )
-                numerator = self.profits[i]*self.cust_pref[i] - self.profits[j]*self.cust_pref[j]
-                denominator = self.cust_pref[i] - self.cust_pref[j]
-                intersections.append(numerator/denominator)
+                if j == (len(self.profits)-1):
+                    intersections.append(self.profits[i])
+                else:
+                    numerator = self.profits[i]*self.cust_pref[i] - self.profits[j]*self.cust_pref[j]
+                    denominator = self.cust_pref[i] - self.cust_pref[j]
+                    intersections.append(numerator/denominator)
 
         inter_pairs = np.asarray(list(zip(pairs,intersections)))
         index_sorting_intersections = np.argsort(inter_pairs[:,1]) 
         inter_pairs = inter_pairs[index_sorting_intersections]
-
+        # add the 2 end points, (0,0) and (K+1, K+1)
+        inter_pairs = np.insert(inter_pairs, 0, np.array([[(0,0), -999999999]]), axis = 0)
+        inter_pairs = np.append(inter_pairs, np.array([[(len(self.profits), len(self.profits)), 999999999]]), axis  = 0)
+        
         return inter_pairs
 
     def staticMNL(self, intersections, constraint):
@@ -89,38 +97,36 @@ class MNL():
             intersections: sorted intersections :: list of [(i,j), I(i,j)] \forall interactions
             constraint: constraint for number of items in assortment
         '''
-
         #initialisation
         A = []
         G = set()
         B = set()
-        sigma = np.argsort(-self.cust_pref) #descending order 
+        #v deals with only the inside options, drop the outside option
+        sigma = np.argsort(-self.cust_pref[:-1]) #descending order 
 
         G.update(sigma[:constraint])
         A.append(sigma[:constraint].tolist())
 
-        #iterate interactions
-        for t,zipped in enumerate(intersections):
-            if zipped[0][1] != len(self.profits) :
+        for t, zipped in enumerate(intersections):
+            #skip the 2 end points
+            if (t==0) or (t == len(intersections)-1):
+                continue
+            if zipped[0][1] != (len(self.profits)-1) : #last index(column) will be our 0
                 #swap order
                 swap_values = zipped[0]
                 swap_index = np.argwhere(np.isin(sigma, swap_values)).flatten()
                 swap_1, swap_2 = sigma[swap_index[0]], sigma[swap_index[1]]
                 sigma[swap_index[0]], sigma[swap_index[1]] = swap_2, swap_1
             else:
-                B.add(zipped[0][1])
-                print('swapped')
+                B.add(zipped[0][0])
 
-            #update G each iteration
-            G.clear()
-            G.update(sigma[:constraint])
-
-            #if anything in B is in G, remove
+            
+            G = set(sigma[:constraint])
+            
             A_t = G - B
+
             if A_t:
                 A.append(list(A_t))
-
-        # A = np.array(A) + 1
 
         return A
 
@@ -181,6 +187,7 @@ class ProbitModel(MNL):
         '''
         self.initial_utility = utility
         self.profits = np.asarray(profits)
+        self.outside_profits = 0
     
     def simulate(self,k=500):
         '''
@@ -190,36 +197,21 @@ class ProbitModel(MNL):
         U = V + \epsilon 
         epsilon ~ N(0, \Sigma), and \Sigma represents the correlation
         of items
+
         let V be the mean utility of items
         
         input:
             k: number of samples to generate, default = 500
         '''
-        self.corr_mat = self.initial_utility.corr() #requires utility to be df
+        self.cov_mat = self.initial_utility.cov() #requires utility to be df
         self.V = self.initial_utility.mean(axis = 0)
-        generate_samples = np.random.multivariate_normal(self.V, self.corr_mat, size = k)
-
+        generate_samples = np.random.multivariate_normal(self.V, self.cov_mat, size = k)
         return generate_samples
 
-    def empirical_probabilities(self, data):
-        '''
-        Finds the empirical choice probabilities of each item(returns index of item)
-
-        input:
-            data: simulated data (format : user x item of utilities)
-        '''
-        df = pd.DataFrame(data)
-        #determine which item(index) has highest utility
-        max_utility = df.apply(np.argmax, axis =1)
-        probabilities = max_utility.value_counts() / len(max_utility)
-        probabilities = probabilities.reindex(df.columns, fill_value=0)
-        self.cust_pref = probabilities
-    
-        return probabilities
 
     def get_assortments(self, samples, constraint):
         '''
-        exhaustive search, to get all combinations of assortments
+        exhaustive search, to get all combinations of assortments, excluding outside option
 
         returns list of set of combinations available
 
@@ -227,8 +219,65 @@ class ProbitModel(MNL):
             constraint: represents the maximum assortment size
         '''
         samples_ = pd.DataFrame(samples)
+        samples_.drop(samples_.columns[-1], axis = 1 , inplace = True) #exclude outside option
         combis = []
-        for k in range(1, constraint):
-            combis.extend( list(map(list, itertools.combinations( pd.DataFrame(samples).columns, k) )) )
+        for k in range(1, constraint+1):
+            combis.append( list(map(list, itertools.combinations( samples_.columns, k) )) )
+
         return combis
+
+    def proba(self, data):
+        '''
+        Finds the empirical choice probabilities of each item(returns index of item)
+                
+        input:
+            data: simulated data (format : user x item of utilities) - must be in np array
+        '''
+        max_utility = np.argmax(data, axis = 1)
+        indexes, counts = np.unique(max_utility, return_counts = True)
+        full_index = list(range(data.shape[1]))
+        check_in = np.isin(full_index, indexes)
+        if any(~check_in):
+            for index, i in enumerate(check_in):
+                if not i:
+                    counts = np.insert(counts, index, 0)
+        return counts/counts.sum() 
+
+    def tabulate_prof(self, assortment, sample):
+        '''
+        tabulates profits in one assortment
+        
+        input:
+            samples: simulated samples (np .array)
+            assortments: 1 assortment, excluding the outside option
+        '''
+        v= sample[:,assortment + [-1]]
+        w = self.profits[assortment + [-1]]
+        probs = self.proba(v)
+        return assortment, np.dot(probs, w)
+
+    def max_profit(self, assortments, sample):
+        '''
+        Iterates through all possible assortments,
+        returns the assortment that gives max profits
+
+        inputs:
+            assortments: List of lists of list of assortments 
+                        (each assortment in 1 list), multiple assortments corresponding
+                        to size of assortment in list
+                        list to hold all the C constraints of assortments
+            sample: np array of assortments 
+        '''
+        max_prof = 0
+        for index, assort_size in enumerate(assortments):
+            print('Tabulating assorment size = ', index+1)
+            for assorting in assort_size:
+                val = self.tabulate_prof(assorting, sample)
+                if val[1]> max_prof:
+                    max_prof = val[1]
+                    best_max = val
+            print('finished assortment size = ', index + 1)
+
+        return best_max
+
     
